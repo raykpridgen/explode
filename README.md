@@ -16,8 +16,13 @@ This pipeline transforms raw HEAT simulation data (CYL and PLI modalities) into 
 ## Quick Start
 
 ```bash
-# 1. Download data (if not already present)
-./scripts/download_data.sh -m cyl -o ./data
+# 1. Download data (choose one method)
+
+# Method A: Selective download (~150GB for 2100 instances, recommended)
+python scripts/download_selective.py --modality cyl --data-root ./data
+
+# Method B: Full tar download (~50GB for CYL, ~2.6TB for PLI)
+# ./scripts/download_data.sh -m cyl -o ./data
 
 # 2. Preprocess raw data to packed NPZ
 python scripts/preprocess.py --modality cyl --data-root ./data --output-dir ./processed
@@ -84,6 +89,83 @@ sbatch ./scripts/download_data.sh -m cyl
 **Expected duration:**
 - Download: 30-90 minutes (depends on connection)
 - Extraction: 10-30 minutes (depends on storage speed)
+
+---
+
+### Step 1 (Alternative): Selective Instance Download (`download_selective.py`)
+
+**Recommended for limited storage/bandwidth.** Downloads individual simulation instances (id00001-id02100) rather than full tar archives.
+
+**Storage comparison:**
+- Selective (2100 instances): ~150GB for CYL, ~300GB for PLI
+- Full tar: ~50GB for CYL, ~2.6TB for PLI
+
+**URLs:**
+- CYL: `https://oceans11.lanl.gov/heat/cyl/cx241203_fp16_full/idXXXXX/`
+- PLI: `https://oceans11.lanl.gov/heat/pli/pli240420/idXXXXX/`
+
+**Usage:**
+```bash
+# Download all 2100 instances for CYL
+python scripts/download_selective.py --modality cyl --data-root ./data
+
+# Download specific range (for parallel batch jobs)
+python scripts/download_selective.py --modality pli --start-id 1 --end-id 500 --data-root ./data_part1
+
+# Resume interrupted download (automatic)
+python scripts/download_selective.py --modality cyl --data-root ./data
+
+# Dry run to see what would be downloaded
+python scripts/download_selective.py --modality cyl --dry-run --data-root ./data
+
+# Fast mode with more connections
+python scripts/download_selective.py --modality cyl --connections 8 --max-concurrent 32
+```
+
+**What it does:**
+1. Scans Apache directory listings for each instance (id00001 to id02100)
+2. Generates aria2c URL list with per-file output paths
+3. Checks for existing files to support resume
+4. Runs aria2c with parallel connections for efficient download
+5. Verifies completeness after download
+
+**Features:**
+- **Resume support**: aria2c automatically resumes interrupted downloads
+- **Existing file check**: Skips files that already exist (matches size/time)
+- **Parallel downloads**: Configurable concurrent downloads (default: 16)
+- **Per-instance directories**: Organizes files as `data/{cyl,pli}/idXXXXX/*.npz`
+
+**Scaling estimates:**
+
+| Resource | CYL (2100 inst) | PLI (2100 inst) |
+|----------|----------------|-----------------|
+| Wall time | ~2-4 hours | ~4-8 hours |
+| Memory | ~2 GB | ~2 GB |
+| Network | ~150 GB | ~300 GB |
+| Output | ~150 GB | ~300 GB |
+| CPU | 2-4 cores | 2-4 cores |
+
+**HPC resource specification:**
+```bash
+# Slurm for selective download (CYL)
+#SBATCH --time=06:00:00
+#SBATCH --mem=8G
+#SBATCH --cpus-per-task=4
+#SBATCH --partition=standard  # No GPU needed
+```
+
+**Parallel batch strategy:**
+For very large downloads, split across multiple jobs:
+```bash
+# Job 1: Instances 1-700
+python scripts/download_selective.py --modality pli --start-id 1 --end-id 700 &
+
+# Job 2: Instances 701-1400
+python scripts/download_selective.py --modality pli --start-id 701 --end-id 1400 &
+
+# Job 3: Instances 1401-2100
+python scripts/download_selective.py --modality pli --start-id 1401 --end-id 2100 &
+```
 
 ---
 
@@ -312,10 +394,11 @@ export DATA_ROOT=./data
 export PROCESSED=./processed
 export OUT=./out
 
-# 1. Download (skip if already present)
+# 1. Download (choose method, skip if already present)
 if [ ! -d "$DATA_ROOT/cyl/id00001" ]; then
-    echo "=== Downloading CYL data ==="
-    ./scripts/download_data.sh -m cyl -o $DATA_ROOT
+    echo "=== Downloading CYL data (selective method) ==="
+    python scripts/download_selective.py --modality cyl --data-root $DATA_ROOT
+    # Alternative: ./scripts/download_data.sh -m cyl -o $DATA_ROOT
 fi
 
 # 2. Preprocess (skip if already present)
@@ -356,7 +439,8 @@ echo "=== Pipeline complete ==="
 ```
 explode/
 ├── scripts/
-│   ├── download_data.sh       # Data download script
+│   ├── download_data.sh         # Full tar download script
+│   ├── download_selective.py    # Selective instance downloader (recommended)
 │   ├── preprocess.py            # Raw → packed NPZ
 │   ├── train_explode.py         # Training + evaluation
 │   └── vis.py                   # Visualization
@@ -403,25 +487,41 @@ Use this table to estimate resources for your HPC allocation:
 
 | Stage | Input size | Output size | Min time | Recommended time | Min memory | Recommended memory | GPU |
 |-------|-----------|-------------|----------|----------------|------------|------------------|-----|
-| Download CYL | - | ~50 GB | 30 min | 1 hour | 4 GB | 8 GB | No |
-| Download PLI | - | ~100 GB | 1 hour | 2 hours | 8 GB | 16 GB | No |
-| Preprocess CYL | ~50 GB | ~6 GB | 20 min | 1 hour | 8 GB | 16 GB | No |
-| Preprocess PLI | ~100 GB | ~24 GB | 40 min | 2 hours | 16 GB | 32 GB | No |
+| **Download Methods** ||||||||
+| Selective CYL (2100 inst) | - | ~150 GB | 2 hours | 4 hours | 4 GB | 8 GB | No |
+| Selective PLI (2100 inst) | - | ~300 GB | 4 hours | 8 hours | 8 GB | 16 GB | No |
+| Full tar CYL | - | ~50 GB | 30 min | 1 hour | 4 GB | 8 GB | No |
+| Full tar PLI | - | ~2.6 TB | 2 hours | 4 hours | 8 GB | 32 GB | No |
+| **Processing** ||||||||
+| Preprocess CYL | ~150 GB | ~6 GB | 20 min | 1 hour | 8 GB | 16 GB | No |
+| Preprocess PLI | ~300 GB | ~24 GB | 40 min | 2 hours | 16 GB | 32 GB | No |
 | Train (Ti, 5ep) | ~6 GB | ~2 GB | 30 min | 1 hour | 8 GB | 16 GB | Yes (8 GB) |
 | Train (M, 5ep) | ~6 GB | ~2 GB | 2 hours | 4 hours | 16 GB | 32 GB | Yes (16 GB) |
 | Vis (5 rollouts) | ~2 GB | ~1 GB | 10 min | 30 min | 8 GB | 16 GB | Yes (8 GB) |
 
-**Typical full pipeline (CYL, Medium model):**
-- **Total time**: ~4-6 hours wall clock
-- **Storage**: ~60 GB (raw + processed + outputs)
+**Typical full pipeline (CYL, Medium model, selective download):**
+- **Total time**: ~8-10 hours wall clock (4h download + 0.5h preprocess + 2h train + 0.5h vis)
+- **Storage**: ~160 GB (150GB raw + 6GB processed + 4GB outputs)
 - **GPU**: 1× A100 (40 GB) or V100 (16 GB)
 - **Memory**: 32 GB RAM
 
-**Full dataset (CYL + PLI, Medium models):**
-- **Total time**: ~8-12 hours wall clock
-- **Storage**: ~180 GB
+**Typical full pipeline (CYL, Medium model, full tar download):**
+- **Total time**: ~4-6 hours wall clock (1h download + 0.5h preprocess + 2h train + 0.5h vis)
+- **Storage**: ~60 GB (50GB raw + 6GB processed + 4GB outputs)
+- **GPU**: 1× A100 (40 GB) or V100 (16 GB)
+- **Memory**: 32 GB RAM
+- **Note**: Requires 50GB temporary for tar download
+
+**Full dataset (CYL + PLI, Medium models, selective download):**
+- **Total time**: ~16-24 hours wall clock
+- **Storage**: ~470 GB (450GB raw + 30GB processed + 8GB outputs)
 - **GPU**: 2× jobs or sequential on 1× GPU
 - **Memory**: 64 GB RAM
+
+**Full dataset (CYL + PLI, Medium models, full tar download):**
+- **Total time**: ~12-18 hours wall clock
+- **Storage**: ~2.7 TB (2.65TB raw + 30GB processed + 8GB outputs)
+- **Note**: PLI tar is 2.6TB - requires significant temporary storage
 
 ---
 
