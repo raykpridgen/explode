@@ -18,10 +18,14 @@ This pipeline transforms raw HEAT simulation data (CYL and PLI modalities) into 
 ```bash
 # 1. Download data (choose one method)
 
-# Method A: Selective download (~150GB for 2100 instances, recommended)
-python scripts/download_selective.py --modality cyl --data-root ./data
+# Method A: Streaming download - one instance at a time (RECOMMENDED)
+# Automatically resumes, no URL list files, checks each instance
+python scripts/download_streaming.py --modality cyl --data-root ./data
 
-# Method B: Full tar download (~50GB for CYL, ~2.6TB for PLI)
+# Method B: Batch selective download (generates URL lists)
+# python scripts/download_selective.py --modality cyl --data-root ./data
+
+# Method C: Full tar download (~50GB for CYL, ~2.6TB for PLI)
 # ./scripts/download_data.sh -m cyl -o ./data
 
 # 2. Preprocess raw data to packed NPZ
@@ -89,6 +93,85 @@ sbatch ./scripts/download_data.sh -m cyl
 **Expected duration:**
 - Download: 30-90 minutes (depends on connection)
 - Extraction: 10-30 minutes (depends on storage speed)
+
+---
+
+### Step 1 (Primary): Streaming Instance Download (`download_streaming.py`) ⭐ RECOMMENDED
+
+**Best for reliable resume and checkpointing.** Downloads one instance at a time with per-instance completion checking. No URL list files - completely streaming.
+
+**Storage comparison:**
+- CYL (2100 instances): ~150GB
+- PLI (2100 instances): ~300GB
+
+**Resume strategy:**
+- Hidden checkpoint file (`.cyl_download_checkpoint`) tracks last completed instance
+- Each instance verified individually - if all files present, skip to next
+- Partial instances are re-downloaded cleanly
+- Run same command to resume from where you left off
+
+**Usage:**
+```bash
+# Download all 2100 instances (auto-resumes if interrupted)
+python scripts/download_streaming.py --modality cyl --data-root ./data
+
+# Download specific range
+python scripts/download_streaming.py --modality pli --start-id 1 --end-id 500
+
+# Force restart from beginning (ignore checkpoint)
+python scripts/download_streaming.py --modality cyl --restart
+
+# More parallel connections per file
+python scripts/download_streaming.py --modality cyl --connections 8
+```
+
+**What it does:**
+1. Reads checkpoint file to find last completed instance (if resuming)
+2. For each instance from checkpoint+1 to end:
+   - Scan server directory for NPZ files
+   - Check if all files already exist locally (complete)
+   - If complete: skip, update checkpoint
+   - If incomplete: clear partial files, download all via aria2c, verify, update checkpoint
+3. On success: remove checkpoint file
+4. On interrupt: checkpoint saved, resume on next run
+
+**Key advantages over batch method:**
+- **No URL list files** - doesn't create large intermediate files
+- **Granular resume** - knows exactly which instance to continue from
+- **Clean partial handling** - re-downloads partial instances completely (safer than resuming individual files)
+- **Memory efficient** - only holds one instance's URLs in memory at a time
+
+**Scaling estimates:**
+
+| Resource | CYL (2100 inst) | PLI (2100 inst) |
+|----------|----------------|-----------------|
+| Wall time | ~2-4 hours | ~4-8 hours |
+| Memory | ~2 GB | ~2 GB |
+| Network | ~150 GB | ~300 GB |
+| Output | ~150 GB | ~300 GB |
+| CPU | 2-4 cores | 2-4 cores |
+
+**HPC resource specification:**
+```bash
+# Slurm for streaming download (CYL)
+#SBATCH --job-name=heat_stream
+#SBATCH --time=06:00:00
+#SBATCH --mem=8G
+#SBATCH --cpus-per-task=4
+#SBATCH --partition=shared
+
+python scripts/download_streaming.py --modality cyl --data-root /scratch/$USER/data
+```
+
+**Checkpoint file location:**
+```
+data/
+  ├── .cyl_download_checkpoint    # Hidden file, last completed ID
+  ├── cyl/
+  │   ├── id00001/
+  │   ├── id00002/
+  │   └── ...
+```
 
 ---
 
@@ -394,11 +477,10 @@ export DATA_ROOT=./data
 export PROCESSED=./processed
 export OUT=./out
 
-# 1. Download (choose method, skip if already present)
+# 1. Download (skip if already present, auto-resumes if interrupted)
 if [ ! -d "$DATA_ROOT/cyl/id00001" ]; then
-    echo "=== Downloading CYL data (selective method) ==="
-    python scripts/download_selective.py --modality cyl --data-root $DATA_ROOT
-    # Alternative: ./scripts/download_data.sh -m cyl -o $DATA_ROOT
+    echo "=== Downloading CYL data (streaming method) ==="
+    python scripts/download_streaming.py --modality cyl --data-root $DATA_ROOT
 fi
 
 # 2. Preprocess (skip if already present)
@@ -440,7 +522,8 @@ echo "=== Pipeline complete ==="
 explode/
 ├── scripts/
 │   ├── download_data.sh         # Full tar download script
-│   ├── download_selective.py    # Selective instance downloader (recommended)
+│   ├── download_streaming.py    # Streaming instance downloader (RECOMMENDED)
+│   ├── download_selective.py    # Batch selective downloader
 │   ├── preprocess.py            # Raw → packed NPZ
 │   ├── train_explode.py         # Training + evaluation
 │   └── vis.py                   # Visualization
@@ -488,8 +571,10 @@ Use this table to estimate resources for your HPC allocation:
 | Stage | Input size | Output size | Min time | Recommended time | Min memory | Recommended memory | GPU |
 |-------|-----------|-------------|----------|----------------|------------|------------------|-----|
 | **Download Methods** ||||||||
-| Selective CYL (2100 inst) | - | ~150 GB | 2 hours | 4 hours | 4 GB | 8 GB | No |
-| Selective PLI (2100 inst) | - | ~300 GB | 4 hours | 8 hours | 8 GB | 16 GB | No |
+| Streaming CYL (2100 inst) | - | ~150 GB | 2 hours | 4 hours | 2 GB | 8 GB | No |
+| Streaming PLI (2100 inst) | - | ~300 GB | 4 hours | 8 hours | 2 GB | 16 GB | No |
+| Batch CYL (2100 inst) | - | ~150 GB | 2 hours | 4 hours | 4 GB | 8 GB | No |
+| Batch PLI (2100 inst) | - | ~300 GB | 4 hours | 8 hours | 8 GB | 16 GB | No |
 | Full tar CYL | - | ~50 GB | 30 min | 1 hour | 4 GB | 8 GB | No |
 | Full tar PLI | - | ~2.6 TB | 2 hours | 4 hours | 8 GB | 32 GB | No |
 | **Processing** ||||||||

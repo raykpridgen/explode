@@ -118,20 +118,47 @@ def get_instance_files(modality: str, instance_id: int, logger: logging.Logger) 
     return npz_files
 
 
+def is_file_complete(file_path: Path) -> bool:
+    """
+    Check if a file is completely downloaded (not partial).
+    
+    aria2c creates .aria2 control files for partial downloads.
+    A file is considered complete if:
+    - It exists
+    - No .aria2 control file exists for it
+    - File size is > 0
+    """
+    if not file_path.exists():
+        return False
+    
+    # Check for aria2c control file (indicates partial download)
+    control_file = Path(str(file_path) + ".aria2")
+    if control_file.exists():
+        return False  # Partial download, needs resume
+    
+    # Check file size
+    if file_path.stat().st_size == 0:
+        return False  # Empty file, needs re-download
+    
+    return True
+
+
 def generate_url_list(
     modality: str,
     start_id: int,
     end_id: int,
     data_root: Path,
     logger: logging.Logger,
-) -> Tuple[Path, int, int]:
+    session_file: Optional[Path] = None,
+) -> Tuple[Path, int, int, int]:
     """
     Generate aria2c URL list file for specified instances.
     
-    Checks for existing files to support resume.
+    Checks for existing files to support resume. Also updates session file
+    to mark complete downloads.
     
     Returns:
-        (url_list_path, total_files, existing_files)
+        (url_list_path, total_files, existing_files, partial_files)
     """
     base_url = BASE_URLS[modality]
     modality_dir = data_root / modality
@@ -144,6 +171,7 @@ def generate_url_list(
     
     total_files = 0
     existing_files = 0
+    partial_files = 0
     
     logger.info(f"Generating URL list for {modality} instances {start_id}-{end_id}")
     
@@ -158,23 +186,29 @@ def generate_url_list(
             for filename in files:
                 total_files += 1
                 
-                # Check if file already exists
+                # Check if file already exists and is complete
                 local_path = instance_dir / filename
-                if local_path.exists():
+                if is_file_complete(local_path):
                     existing_files += 1
-                    logger.debug(f"Skipping existing: {local_path}")
+                    logger.debug(f"Skipping complete file: {local_path}")
                     continue
+                elif local_path.exists():
+                    partial_files += 1
+                    logger.debug(f"Resuming partial file: {local_path}")
                 
-                # Write URL to list
+                # Write URL to list (aria2c will resume if partial)
                 file_url = urljoin(base_url, f"{instance_str}/{filename}")
                 # aria2c format: URL with output path
                 out_path = str(instance_dir / filename)
                 f.write(f"{file_url}\n  out={out_path}\n")
     
     logger.info(f"URL list: {url_list_file}")
-    logger.info(f"Total files: {total_files}, Existing: {existing_files}, To download: {total_files - existing_files}")
+    logger.info(f"Total files: {total_files}")
+    logger.info(f"  Complete (skip): {existing_files}")
+    logger.info(f"  Partial (resume): {partial_files}")
+    logger.info(f"  New (download): {total_files - existing_files - partial_files}")
     
-    return url_list_file, total_files, existing_files
+    return url_list_file, total_files, existing_files, partial_files
 
 
 def run_aria2c(
@@ -183,6 +217,7 @@ def run_aria2c(
     connections: int,
     max_concurrent: int,
     logger: logging.Logger,
+    session_file: Optional[Path] = None,
 ) -> bool:
     """
     Run aria2c with URL list.
@@ -193,6 +228,7 @@ def run_aria2c(
         connections: Connections per server
         max_concurrent: Max concurrent downloads
         logger: Logger
+        session_file: Path to save session for resume (optional)
     
     Returns:
         True if successful
@@ -205,7 +241,11 @@ def run_aria2c(
         logger.error("aria2c not found. Please install aria2c.")
         return False
     
-    # Build aria2c command
+    # Create session file path if not provided
+    if session_file is None:
+        session_file = url_list.with_suffix(".session")
+    
+    # Build aria2c command with proper resume support
     cmd = [
         "aria2c",
         "--input-file", str(url_list),
@@ -213,18 +253,34 @@ def run_aria2c(
         "--max-connection-per-server", str(connections),
         "--split", str(connections),
         "--max-concurrent-downloads", str(max_concurrent),
-        "--continue", "true",  # Resume support
+        # Resume support - use session file
+        "--save-session", str(session_file),
+        "--save-session-interval", "30",  # Save every 30 seconds
+        "--continue", "true",
         "--remote-time", "true",
+        # File handling - be conservative
         "--auto-file-renaming", "false",
         "--allow-overwrite", "false",
-        "--conditional-get", "true",  # Don't re-download if file exists and matches
+        "--auto-resume", "true",  # Try to resume if file exists
+        # Retry logic
+        "--max-tries", "5",
+        "--retry-wait", "10",
+        "--timeout", "60",
+        # Logging
         "--log-level", "warn",
         "--summary-interval", "30",
         "--console-log-level", "warn",
+        "--download-result", "default",
     ]
     
-    logger.info(f"Starting aria2c: {' '.join(cmd)}")
+    # If session file exists, load it (for resume)
+    if session_file.exists():
+        logger.info(f"Found existing session file: {session_file}")
+        cmd.extend(["--load-cookies", str(session_file)])
+    
+    logger.info(f"Starting aria2c: {' '.join(cmd[:10])} ...")
     logger.info(f"Connections per server: {connections}, Max concurrent: {max_concurrent}")
+    logger.info(f"Session file: {session_file}")
     
     start_time = time.time()
     
@@ -232,12 +288,22 @@ def run_aria2c(
         result = subprocess.run(cmd, check=True)
         elapsed = time.time() - start_time
         logger.info(f"Download complete in {elapsed/60:.1f} minutes")
+        
+        # Clean up session file on successful completion
+        if session_file.exists():
+            session_file.unlink()
+            logger.info(f"Removed completed session file: {session_file}")
+        
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"aria2c failed with exit code {e.returncode}")
+        logger.info(f"Session saved to: {session_file}")
+        logger.info("Run again to resume from where it left off.")
         return False
     except KeyboardInterrupt:
-        logger.warning("Download interrupted by user. Run again to resume.")
+        logger.warning("Download interrupted by user.")
+        logger.info(f"Session saved to: {session_file}")
+        logger.info("Run again to resume from where it left off.")
         return False
 
 
@@ -392,18 +458,28 @@ Note:
         logger.error("Start ID must be <= end ID")
         sys.exit(1)
     
-    # Generate URL list
-    url_list, total_files, existing_files = generate_url_list(
+    # Define session file path
+    session_file = args.data_root / f"{args.modality}_session_{args.start_id:05d}_{args.end_id:05d}.txt"
+    
+    # Check for existing session file (resume mode)
+    if session_file.exists():
+        logger.info(f"Found existing session file: {session_file}")
+        logger.info("This indicates a previous interrupted download. Resuming...")
+    
+    # Generate URL list (checks for existing/partial files)
+    url_list, total_files, existing_files, partial_files = generate_url_list(
         args.modality,
         args.start_id,
         args.end_id,
         args.data_root,
         logger,
+        session_file,
     )
     
     # Check if all files already exist
-    if total_files > 0 and existing_files == total_files:
-        logger.info("All files already exist! Nothing to download.")
+    to_download = total_files - existing_files - partial_files
+    if total_files > 0 and to_download == 0 and partial_files == 0:
+        logger.info("All files already complete! Nothing to download.")
         if args.verify:
             verify_download(
                 args.modality,
@@ -421,13 +497,14 @@ Note:
         logger.info(f"  aria2c --input-file {url_list} -j {args.max_concurrent}")
         sys.exit(0)
     
-    # Run aria2c
+    # Run aria2c with session file for resume support
     success = run_aria2c(
         url_list,
         args.data_root,
         args.connections,
         args.max_concurrent,
         logger,
+        session_file,
     )
     
     if not success:
