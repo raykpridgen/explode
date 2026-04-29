@@ -1,0 +1,18 @@
+{
+  "modality": "cyl",
+  "split_seed": 42,
+  "train": [
+    "id00004",
+    "id00003",
+    "id00006",
+    "id00005"
+  ],
+  "val": [],
+  "test": [
+    "id00002",
+    "id00001"
+  ],
+  "n_train": 4,
+  "n_val": 0,
+  "n_test": 2
+}
