@@ -209,7 +209,7 @@ def download_instance(
         "--split", str(connections),
         "--max-concurrent-downloads", str(min(16, len(files))),
         "--continue", "true",
-        "--auto-resume", "true",
+        "--always-resume", "true",
         "--remote-time", "true",
         "--allow-overwrite", "true",  # Overwrite partial files
         "--max-tries", str(max_retries),
