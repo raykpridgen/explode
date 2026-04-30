@@ -483,9 +483,9 @@ Memory efficiency:
 
 Output structure:
     out/
-        splits.json              # Train/val/test instance IDs
         train/
             {modality}/
+                splits.json       # Train/val/test instance IDs for this modality
                 metrics.csv      # Per-epoch training log
                 models/
                     {modality}_best.pth     # Best model only
@@ -612,8 +612,8 @@ Output structure:
     train_idx, val_idx, test_idx = split_instances(n_instances, args.split_seed)
     logger.info(f"Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
     
-    # Save splits.json
-    splits_path = args.out_dir / "splits.json"
+    # Save splits.json (modality-specific path to avoid cross-run overwrite confusion)
+    splits_path = train_dir / "splits.json"
     save_splits(
         splits_path,
         modality,
@@ -623,6 +623,19 @@ Output structure:
         instance_ids[test_idx].tolist(),
     )
     logger.info(f"Saved splits to {splits_path}")
+
+    # Legacy global path retained for backward compatibility with older tooling.
+    legacy_splits_path = args.out_dir / "splits.json"
+    if legacy_splits_path != splits_path:
+        save_splits(
+            legacy_splits_path,
+            modality,
+            args.split_seed,
+            instance_ids[train_idx].tolist(),
+            instance_ids[val_idx].tolist(),
+            instance_ids[test_idx].tolist(),
+        )
+        logger.info(f"Saved legacy splits to {legacy_splits_path}")
     
     # Prepare volume for MORPH: (N, T, 9, H, W) -> (N, T, F, C, D, H, W)
     # We have 9 channels = 3 fields × 3 components

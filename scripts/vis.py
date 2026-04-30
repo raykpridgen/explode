@@ -240,6 +240,7 @@ def load_model(
 def load_test_data(
     data_npz: Path,
     splits_json: Path,
+    modality: str,
     logger: logging.Logger,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
     """
@@ -255,6 +256,12 @@ def load_test_data(
     with open(splits_json) as f:
         splits = json.load(f)
     
+    splits_modality = splits.get("modality")
+    if splits_modality and str(splits_modality).lower() != modality.lower():
+        logger.warning(
+            f"Splits modality is '{splits_modality}' but requested modality is '{modality}'"
+        )
+
     test_ids = splits.get("test", [])
     logger.info(f"Test set: {len(test_ids)} instances")
     
@@ -272,6 +279,13 @@ def load_test_data(
     test_volume = volume[test_mask]
     test_timesteps = timesteps[test_mask]
     test_ids_selected = instance_ids[test_mask].tolist()
+
+    missing_test_ids = sorted(set(test_ids) - set(test_ids_selected))
+    if missing_test_ids:
+        logger.warning(
+            f"{len(missing_test_ids)} test IDs from splits were not found in data: "
+            f"{missing_test_ids[:5]}{'...' if len(missing_test_ids) > 5 else ''}"
+        )
     
     logger.info(f"Test volume shape: {test_volume.shape}")
     
@@ -564,7 +578,12 @@ Examples:
     if args.data is None:
         args.data = REPO_ROOT / "processed" / f"{args.modality}_data.npz"
     if args.splits is None:
-        args.splits = REPO_ROOT / "out" / "splits.json"
+        preferred_splits = REPO_ROOT / "out" / "train" / args.modality / "splits.json"
+        legacy_splits = REPO_ROOT / "out" / "splits.json"
+        if preferred_splits.exists():
+            args.splits = preferred_splits
+        else:
+            args.splits = legacy_splits
     if args.metrics is None:
         args.metrics = REPO_ROOT / "out" / "train" / args.modality / "metrics.csv"
     
@@ -596,7 +615,7 @@ Examples:
     
     # Load test data
     test_volume, test_timesteps, r_grid, z_grid, test_ids = load_test_data(
-        args.data, args.splits, logger
+        args.data, args.splits, args.modality, logger
     )
     
     # Limit test instances
