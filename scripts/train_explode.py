@@ -532,6 +532,17 @@ Output structure:
     
     # Data loading args
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers")
+    parser.add_argument(
+        "--eval-num-workers",
+        type=int,
+        default=0,
+        help="Validation/test DataLoader workers (default: 0 for stability)",
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help="Enable persistent training DataLoader workers (disabled by default)",
+    )
     parser.add_argument("--split-seed", type=int, default=42, help="Random seed for splits")
     
     # Output args
@@ -750,18 +761,22 @@ Output structure:
     
     # Create dataloaders using streaming datasets
     logger.info("Creating DataLoaders with streaming datasets...")
+    logger.info(
+        f"DataLoader workers: train={args.num_workers} (persistent={args.persistent_workers}), "
+        f"eval={max(0, args.eval_num_workers)}"
+    )
     train_loader_kwargs = {
         "batch_size": args.batch_size,
         "shuffle": True,
         "num_workers": args.num_workers,
         "pin_memory": torch.cuda.is_available(),
-        "persistent_workers": args.num_workers > 0,  # Keep workers alive between epochs
+        "persistent_workers": args.persistent_workers and args.num_workers > 0,
     }
     if args.num_workers > 0:
         train_loader_kwargs["prefetch_factor"] = 2
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
 
-    eval_num_workers = max(0, min(args.num_workers, 1))
+    eval_num_workers = max(0, args.eval_num_workers)
     eval_loader_kwargs = {
         "batch_size": args.batch_size,
         "shuffle": False,
