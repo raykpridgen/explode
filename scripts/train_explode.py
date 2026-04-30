@@ -86,6 +86,7 @@ class ARWindowDataset(Dataset):
     def __init__(
         self,
         volume: np.ndarray,  # (N, T, F, C, D, H, W) - unnormalized
+        instance_indices: Optional[np.ndarray] = None,
         ar_order: int = 1,
         dtype: torch.dtype = torch.float32,
         normalize: bool = True,
@@ -94,19 +95,25 @@ class ARWindowDataset(Dataset):
         """
         Args:
             volume: Raw volume array (N, T, F, C, D, H, W) - NOT pre-normalized
+            instance_indices: Optional subset of instance indices into volume.
+                If None, uses all instances.
             ar_order: Autoregressive order (default: 1)
             dtype: Torch dtype for output tensors
             normalize: Whether to apply per-instance normalization
             eps: Epsilon for numerical stability in normalization
         """
         self.volume = volume
+        if instance_indices is None:
+            self.instance_indices = np.arange(volume.shape[0], dtype=np.int64)
+        else:
+            self.instance_indices = np.asarray(instance_indices, dtype=np.int64)
         self.ar_order = ar_order
         self.dtype = dtype
         self.normalize = normalize
         self.eps = eps
         
         # Compute windows per instance
-        self.n_instances = volume.shape[0]
+        self.n_instances = int(self.instance_indices.shape[0])
         self.n_timesteps = volume.shape[1]
         self.n_fields = volume.shape[2]
         self.n_components = volume.shape[3]
@@ -125,11 +132,14 @@ class ARWindowDataset(Dataset):
     def _compute_instance_stats(self) -> List[Dict]:
         """Compute mean and std for each instance across time dimension."""
         stats = []
-        for i in range(self.n_instances):
-            instance_data = self.volume[i]  # (T, F, C, D, H, W)
+        for local_idx in range(self.n_instances):
+            global_idx = int(self.instance_indices[local_idx])
+            instance_data = self.volume[global_idx]  # (T, F, C, D, H, W)
             # Compute stats per (F, C) across time, D, H, W
-            mean = np.mean(instance_data, axis=(0, 3, 4, 5), keepdims=True)  # (1, F, C, 1, 1, 1)
-            std = np.std(instance_data, axis=(0, 3, 4, 5), keepdims=True) + self.eps
+            mean = np.mean(instance_data, axis=(0, 3, 4, 5), keepdims=True, dtype=np.float64).astype(np.float32)
+            std = (
+                np.std(instance_data, axis=(0, 3, 4, 5), keepdims=True, dtype=np.float64).astype(np.float32) + self.eps
+            )
             stats.append({"mean": mean, "std": std})
         return stats
     
@@ -154,21 +164,26 @@ class ARWindowDataset(Dataset):
             (x, y) where x is input window, y is target (both normalized)
         """
         # Map global index to (instance, timestep)
-        instance_idx = idx // self.n_windows_per_instance
+        local_instance_idx = idx // self.n_windows_per_instance
         local_window_idx = idx % self.n_windows_per_instance
         t_start = local_window_idx
+        global_instance_idx = int(self.instance_indices[local_instance_idx])
         
         # Extract window
         # x: (ar_order, F, C, D, H, W)
-        x = self.volume[instance_idx, t_start:t_start + self.ar_order].copy()
+        x = self.volume[global_instance_idx, t_start:t_start + self.ar_order]
         
         # y: (F, C, D, H, W) - target is next frame
-        y = self.volume[instance_idx, t_start + self.ar_order].copy()
+        y = self.volume[global_instance_idx, t_start + self.ar_order]
         
         # Apply per-instance normalization
         if self.normalize:
-            x = self._normalize_instance(instance_idx, x)
-            y = self._normalize_instance(instance_idx, y)
+            x = self._normalize_instance(local_instance_idx, x)
+            y = self._normalize_instance(local_instance_idx, y)
+        else:
+            # Ensure contiguous arrays before tensor conversion
+            x = np.ascontiguousarray(x)
+            y = np.ascontiguousarray(y)
         
         # Convert to torch tensors
         x_tensor = torch.from_numpy(x).to(self.dtype)
@@ -493,6 +508,13 @@ Output structure:
     # Checkpoint args
     parser.add_argument("--save-freq", type=int, default=100,
                         help="Save step checkpoint every N steps (0 to disable)")
+    parser.add_argument(
+        "--epoch-checkpoints",
+        type=int,
+        nargs="+",
+        default=[10, 25, 50],
+        help="Epoch numbers (1-indexed) to save full checkpoints",
+    )
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume from checkpoint path")
     parser.add_argument("--eval-only", action="store_true",
@@ -587,16 +609,12 @@ Output structure:
     D = 1
     volume_uptf7 = volume.reshape(n_instances, max_t, 3, 3, D, H, W)
     volume_uptf7 = volume_uptf7.transpose(0, 1, 2, 3, 4, 5, 6)  # (N, T, F, C, D, H, W)
-    volume_uptf7 = volume_uptf7.astype(np.float32)
+    volume_uptf7 = volume_uptf7.astype(np.float32, copy=False)
     
-    # Split data
-    train_vol = volume_uptf7[train_idx]
-    val_vol = volume_uptf7[val_idx]
-    test_vol = volume_uptf7[test_idx]
-    
-    logger.info(f"Train volume: {train_vol.shape}")
-    logger.info(f"Val volume: {val_vol.shape}")
-    logger.info(f"Test volume: {test_vol.shape}")
+    # Use index-based split datasets to avoid materializing train/val/test array copies.
+    logger.info(f"Train instances: {len(train_idx)}")
+    logger.info(f"Val instances: {len(val_idx)}")
+    logger.info(f"Test instances: {len(test_idx)}")
     
     # Memory-efficient approach: Use per-instance normalization in streaming dataset
     # instead of MORPH RevIN which creates large intermediate arrays
@@ -605,7 +623,7 @@ Output structure:
     
     # Clean up intermediate arrays to save memory
     logger.info("Cleaning up intermediate arrays...")
-    del volume, volume_uptf7
+    del volume
     import gc
     gc.collect()
     
@@ -615,22 +633,35 @@ Output structure:
     
     # Create streaming datasets with per-instance normalization
     # Normalization is computed per-instance inside the DataLoader workers
-    train_dataset = ARWindowDataset(train_vol, ar_order=args.ar_order, normalize=True)
+    train_dataset = ARWindowDataset(
+        volume_uptf7,
+        instance_indices=train_idx,
+        ar_order=args.ar_order,
+        normalize=True,
+    )
     
-    if val_vol.shape[0] > 0:
-        val_dataset = ARWindowDataset(val_vol, ar_order=args.ar_order, normalize=True)
+    if len(val_idx) > 0:
+        val_dataset = ARWindowDataset(
+            volume_uptf7,
+            instance_indices=val_idx,
+            ar_order=args.ar_order,
+            normalize=True,
+        )
     else:
         # Create dataset from train for validation if no val split
         val_dataset = None
         logger.warning("No validation split, using training metrics only")
     
-    test_dataset = ARWindowDataset(test_vol, ar_order=args.ar_order, normalize=True)
+    test_dataset = ARWindowDataset(
+        volume_uptf7,
+        instance_indices=test_idx,
+        ar_order=args.ar_order,
+        normalize=True,
+    )
     
-    # Free the split volumes - they're now referenced inside the datasets
-    # The dataset keeps them, but normalizes on-the-fly
-    # We can optionally delete them if memory is still tight, but dataset needs them
     logger.info("Dataset created with per-instance normalization")
-    logger.info(f"Memory per instance: {train_vol[0].nbytes / 1e9:.2f} GB")
+    if len(train_idx) > 0:
+        logger.info(f"Memory per instance: {volume_uptf7[int(train_idx[0])].nbytes / 1e9:.2f} GB")
     
     logger.info(f"AR windows: train={len(train_dataset)}, val={len(val_dataset) if val_dataset else 0}, test={len(test_dataset)}")
     
@@ -709,30 +740,33 @@ Output structure:
     
     # Create dataloaders using streaming datasets
     logger.info("Creating DataLoaders with streaming datasets...")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,  # Keep workers alive between epochs
-    )
+    train_loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": True,
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": args.num_workers > 0,  # Keep workers alive between epochs
+    }
+    if args.num_workers > 0:
+        train_loader_kwargs["prefetch_factor"] = 2
+    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
+
+    eval_num_workers = max(0, min(args.num_workers, 1))
+    eval_loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": False,
+        "num_workers": eval_num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": False,
+    }
+    if eval_num_workers > 0:
+        eval_loader_kwargs["prefetch_factor"] = 1
+
     val_loader = DataLoader(
         val_dataset if val_dataset is not None else train_dataset,  # Fallback if no val
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
+        **eval_loader_kwargs,
     )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
-    )
+    test_loader = DataLoader(test_dataset, **eval_loader_kwargs)
     
     # Loss function
     criterion = nn.MSELoss()
@@ -770,8 +804,11 @@ Output structure:
     with open(metrics_csv, "w") as f:
         f.write("epoch,train_loss,val_loss,val_mse,val_mae,val_rmse,lr,wall_time_s\n")
     
+    epoch_checkpoint_set = {e for e in args.epoch_checkpoints if e > 0}
+    logger.info(f"Epoch checkpoints configured at: {sorted(epoch_checkpoint_set)}")
     for epoch in range(start_epoch, args.epochs):
         epoch_start = time.time()
+        epoch_num = epoch + 1
         
         # Train
         train_loss, global_step, best_val_loss = train_epoch(
@@ -797,6 +834,19 @@ Output structure:
             }, best_ckpt_path)
             logger.info(f"Saved best model: val_loss={val_loss:.6f}")
         
+        # Save fixed epoch checkpoints (1-indexed epochs)
+        if epoch_num in epoch_checkpoint_set:
+            epoch_ckpt_path = model_dir / f"{modality}_epoch{epoch_num}.pth"
+            torch.save({
+                "epoch": epoch,
+                "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "train_loss": train_loss,
+            }, epoch_ckpt_path)
+            logger.info(f"Saved epoch checkpoint: {epoch_ckpt_path.name}")
+        
         # Cleanup step checkpoint at epoch end
         if step_ckpt_path.exists() and not is_best:
             step_ckpt_path.unlink(missing_ok=True)
@@ -814,7 +864,7 @@ Output structure:
             f.write(log_line)
         
         logger.info(
-            f"Epoch {epoch}/{args.epochs} | "
+            f"Epoch {epoch_num}/{args.epochs} | "
             f"train_loss={train_loss:.6f} | "
             f"val_loss={val_loss:.6f} | "
             f"lr={lr:.2e} | "
