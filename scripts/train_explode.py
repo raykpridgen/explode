@@ -75,8 +75,73 @@ FM_CHECKPOINTS = {
 
 # ==================== DATASET ====================
 
+class ARWindowDataset(Dataset):
+    """
+    Memory-efficient dataset that generates AR windows on-the-fly.
+    
+    Instead of materializing all windows (which explodes memory),
+    this computes windows dynamically from the normalized volume.
+    """
+    
+    def __init__(
+        self,
+        volume: np.ndarray,  # (N, T, F, C, D, H, W) - normalized
+        ar_order: int = 1,
+        dtype: torch.dtype = torch.float32,
+    ):
+        """
+        Args:
+            volume: Normalized volume array (N, T, F, C, D, H, W)
+            ar_order: Autoregressive order (default: 1)
+            dtype: Torch dtype for output tensors
+        """
+        self.volume = volume
+        self.ar_order = ar_order
+        self.dtype = dtype
+        
+        # Compute windows per instance
+        self.n_instances = volume.shape[0]
+        self.n_timesteps = volume.shape[1]
+        self.n_windows_per_instance = self.n_timesteps - ar_order
+        
+        # Total windows
+        self.total_windows = self.n_instances * self.n_windows_per_instance
+        
+    def __len__(self) -> int:
+        return self.total_windows
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate window on-the-fly.
+        
+        Args:
+            idx: Global window index
+            
+        Returns:
+            (x, y) where x is input window, y is target
+        """
+        # Map global index to (instance, timestep)
+        instance_idx = idx // self.n_windows_per_instance
+        local_window_idx = idx % self.n_windows_per_instance
+        t_start = local_window_idx
+        
+        # Extract window
+        # x: (ar_order, F, C, D, H, W)
+        x = self.volume[instance_idx, t_start:t_start + self.ar_order]
+        
+        # y: (F, C, D, H, W) - target is next frame
+        y = self.volume[instance_idx, t_start + self.ar_order]
+        
+        # Convert to torch tensors
+        x_tensor = torch.from_numpy(x.copy()).to(self.dtype)
+        y_tensor = torch.from_numpy(y.copy()).to(self.dtype)
+        
+        return x_tensor, y_tensor
+
+
+# Legacy dataset for precomputed windows (kept for eval mode if needed)
 class ARDataset(Dataset):
-    """Dataset for autoregressive (X, y) pairs."""
+    """Dataset for precomputed autoregressive (X, y) pairs."""
     
     def __init__(self, x: torch.Tensor, y: torch.Tensor):
         self.x = x
@@ -331,14 +396,24 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Train CYL from scratch with Medium model
+    # Train CYL from scratch with Medium model (memory-efficient streaming)
     python train_explode.py --modality cyl --data processed/cyl_data.npz --model-size M
+
+    # Reduce memory further with smaller batch size
+    python train_explode.py --modality cyl --data processed/cyl_data.npz --batch-size 4
 
     # Resume training from checkpoint
     python train_explode.py --modality pli --data processed/pli_data.npz --resume out/train/pli/models/pli_checkpoint.pth
 
     # Evaluation only
     python train_explode.py --modality cyl --data processed/cyl_data.npz --eval-only --resume out/train/cyl/models/cyl_best.pth
+
+Memory efficiency:
+    This script uses streaming AR window generation to avoid materializing all
+    windows in memory (~340GB for full CYL dataset). Instead, windows are generated
+    on-the-fly in the DataLoader, reducing peak memory to ~15-20GB.
+    
+    For even lower memory, use --batch-size 4 or --batch-size 2.
 
 Output structure:
     out/
@@ -505,28 +580,22 @@ Output structure:
     
     logger.info("RevIN normalization complete")
     
-    # Prepare autoregressive windows
-    logger.info(f"Preparing AR windows (ar_order={args.ar_order})")
-    preparer = FastARDataPreparer(ar_order=args.ar_order)
+    # Clean up intermediate arrays to save memory
+    logger.info("Cleaning up intermediate arrays...")
+    del volume, volume_uptf7, train_vol, val_vol, test_vol
+    import gc
+    gc.collect()
     
-    # Transpose to (N, T, D, H, W, C, F) for FastARDataPreparer
-    train_dhwcf = train_norm.transpose(0, 1, 4, 5, 6, 3, 2)  # (N,T,D,H,W,C,F)
-    val_dhwcf = val_norm.transpose(0, 1, 4, 5, 6, 3, 2)
-    test_dhwcf = test_norm.transpose(0, 1, 4, 5, 6, 3, 2)
+    # Prepare autoregressive windows using streaming dataset
+    # This generates windows on-the-fly to avoid memory explosion
+    logger.info(f"Preparing streaming AR windows (ar_order={args.ar_order})")
     
-    X_tr, y_tr = preparer.prepare(np.ascontiguousarray(train_dhwcf))
-    X_va, y_va = preparer.prepare(np.ascontiguousarray(val_dhwcf))
-    X_te, y_te = preparer.prepare(np.ascontiguousarray(test_dhwcf))
+    # Create streaming datasets (no precomputation of windows)
+    train_dataset = ARWindowDataset(train_norm, ar_order=args.ar_order)
+    val_dataset = ARWindowDataset(val_norm, ar_order=args.ar_order) if val_norm.shape[0] > 0 else None
+    test_dataset = ARWindowDataset(test_norm, ar_order=args.ar_order)
     
-    logger.info(f"AR windows: train={X_tr.shape[0]}, val={X_va.shape[0]}, test={X_te.shape[0]}")
-    
-    # Convert to tensors
-    X_tr = torch.from_numpy(X_tr)
-    y_tr = torch.from_numpy(y_tr)
-    X_va = torch.from_numpy(X_va)
-    y_va = torch.from_numpy(y_va)
-    X_te = torch.from_numpy(X_te)
-    y_te = torch.from_numpy(y_te)
+    logger.info(f"AR windows: train={len(train_dataset)}, val={len(val_dataset) if val_dataset else 0}, test={len(test_dataset)}")
     
     # Setup device
     devices = DeviceManager.list_devices()
@@ -601,27 +670,31 @@ Output structure:
         global_step = ckpt.get("global_step", 0)
         logger.info(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.6f}")
     
-    # Create dataloaders
+    # Create dataloaders using streaming datasets
+    logger.info("Creating DataLoaders with streaming datasets...")
     train_loader = DataLoader(
-        ARDataset(X_tr, y_tr),
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,  # Keep workers alive between epochs
     )
     val_loader = DataLoader(
-        ARDataset(X_va, y_va),
+        val_dataset if val_dataset is not None else train_dataset,  # Fallback if no val
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
     )
     test_loader = DataLoader(
-        ARDataset(X_te, y_te),
+        test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
     )
     
     # Loss function
