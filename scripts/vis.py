@@ -343,9 +343,10 @@ def create_comparison_grid(
     r_grid: np.ndarray,
     z_grid: np.ndarray,
     channel_idx: int,
-    timesteps: List[int],
+    frame_indices: List[int],
     output_path: Path,
     title: str = "Rollout Comparison",
+    start_t: int = 1,
     logger: logging.Logger = None,
 ):
     """
@@ -356,50 +357,37 @@ def create_comparison_grid(
         predicted: (T, H, W) predicted data
         r_grid, z_grid: coordinate grids
         channel_idx: which channel to visualize
-        timesteps: list of timestep indices to include
+        frame_indices: list of frame indices into actual/predicted arrays
+        start_t: displayed timestep offset (default=1 since AR predicts t+1)
         output_path: output PNG path
     """
     logger = logger or logging.getLogger(__name__)
     
-    n_frames = len(timesteps)
-    n_cols = min(n_frames, 5)
-    n_rows = (n_frames + n_cols - 1) // n_cols
-    
-    fig, axes = plt.subplots(n_rows * 2, n_cols, figsize=(3 * n_cols, 6 * n_rows))
-    if n_rows == 1 and n_cols == 1:
-        axes = np.array([[axes]])
-    elif n_rows == 1:
-        axes = axes.reshape(2, n_cols)
+    n_frames = len(frame_indices)
+    if n_frames == 0:
+        logger.warning("No frame indices provided for comparison grid")
+        return
+
+    # Fixed 2xN layout: one horizontal strip of N frames (Actual on top, Predicted below).
+    fig, axes = plt.subplots(2, n_frames, figsize=(3 * n_frames, 6), squeeze=False)
     
     # Get color limits from actual data
     vmin, vmax = np.percentile(actual, [2, 98])
     
-    for i, t in enumerate(timesteps):
-        row = (i // n_cols) * 2
-        col = i % n_cols
-        
+    for col, t in enumerate(frame_indices):
+        t_display = start_t + t
+
         # Actual
-        ax_actual = axes[row, col] if n_rows > 1 else axes[0, col]
+        ax_actual = axes[0, col]
         im = ax_actual.pcolormesh(r_grid, z_grid, actual[t], shading="auto", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
-        ax_actual.set_title(f"T={t} (Actual)")
+        ax_actual.set_title(f"T={t_display} (Actual)")
         ax_actual.set_aspect("equal")
         
         # Predicted
-        ax_pred = axes[row + 1, col] if n_rows > 1 else axes[1, col]
+        ax_pred = axes[1, col]
         ax_pred.pcolormesh(r_grid, z_grid, predicted[t], shading="auto", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
-        ax_pred.set_title(f"T={t} (Predicted)")
+        ax_pred.set_title(f"T={t_display} (Predicted)")
         ax_pred.set_aspect("equal")
-    
-    # Hide unused subplots
-    for i in range(n_frames, n_rows * n_cols):
-        row = (i // n_cols) * 2
-        col = i % n_cols
-        if n_rows > 1:
-            axes[row, col].axis("off")
-            axes[row + 1, col].axis("off")
-        else:
-            axes[0, col].axis("off")
-            axes[1, col].axis("off")
     
     # Add colorbar
     fig.subplots_adjust(right=0.9)
@@ -420,6 +408,7 @@ def create_rollout_gif(
     output_path: Path,
     fps: float = 5.0,
     title: str = "Rollout",
+    start_t: int = 1,
     logger: logging.Logger = None,
 ):
     """
@@ -430,6 +419,7 @@ def create_rollout_gif(
         r_grid, z_grid: coordinate grids
         output_path: output GIF path
         fps: frames per second
+        start_t: displayed timestep offset (default=1 since AR predicts t+1)
     """
     logger = logger or logging.getLogger(__name__)
     
@@ -438,9 +428,10 @@ def create_rollout_gif(
     
     pil_frames = []
     for t in range(frames.shape[0]):
+        t_display = start_t + t
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.pcolormesh(r_grid, z_grid, frames[t], shading="auto", cmap=CMAP_FIELD, vmin=vmin, vmax=vmax)
-        ax.set_title(f"{title} - T={t}")
+        ax.set_title(f"{title} - T={t_display}")
         ax.set_aspect("equal")
         fig.colorbar(im, ax=ax)
         
@@ -471,6 +462,7 @@ def create_diff_gif(
     output_path: Path,
     fps: float = 5.0,
     title: str = "Difference",
+    start_t: int = 1,
     logger: logging.Logger = None,
 ):
     """
@@ -482,6 +474,7 @@ def create_diff_gif(
         r_grid, z_grid: coordinate grids
         output_path: output GIF path
         fps: frames per second
+        start_t: displayed timestep offset (default=1 since AR predicts t+1)
     """
     logger = logger or logging.getLogger(__name__)
     
@@ -492,9 +485,10 @@ def create_diff_gif(
     
     pil_frames = []
     for t in range(diff.shape[0]):
+        t_display = start_t + t
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.pcolormesh(r_grid, z_grid, diff[t], shading="auto", cmap=CMAP_DIFF, vmin=vmin, vmax=vmax)
-        ax.set_title(f"{title} - T={t} (Pred - Actual)")
+        ax.set_title(f"{title} - T={t_display} (Pred - Actual)")
         ax.set_aspect("equal")
         fig.colorbar(im, ax=ax, label="Difference")
         
@@ -662,33 +656,37 @@ Examples:
             pred_ch = pred_np[:, ch, :, :]
             actual_ch = actual_np[:, ch, :, :]
             
-            # Comparison grid (subset of frames)
-            grid_frames = list(range(0, n_steps, max(1, n_steps // 8)))[:8]
+            # Comparison grid: 5-6 frames laid out horizontally in a single row.
+            n_grid_frames = min(6, n_steps)
+            if n_grid_frames > 1:
+                grid_frames = np.linspace(0, n_steps - 1, n_grid_frames, dtype=int).tolist()
+            else:
+                grid_frames = [0]
             create_comparison_grid(
                 actual_ch, pred_ch, r_grid, z_grid, ch,
                 grid_frames, instance_dir / f"{ch_name}_comparison.png",
-                f"{instance_id} - {ch_name}", logger
+                f"{instance_id} - {ch_name}", start_t=1, logger=logger
             )
             
             # GIF of prediction
             create_rollout_gif(
                 pred_ch, r_grid, z_grid,
                 instance_dir / f"{ch_name}_predicted.gif",
-                args.fps, f"{instance_id} - {ch_name} (Predicted)", logger
+                args.fps, f"{instance_id} - {ch_name} (Predicted)", start_t=1, logger=logger
             )
             
             # GIF of actual
             create_rollout_gif(
                 actual_ch, r_grid, z_grid,
                 instance_dir / f"{ch_name}_actual.gif",
-                args.fps, f"{instance_id} - {ch_name} (Actual)", logger
+                args.fps, f"{instance_id} - {ch_name} (Actual)", start_t=1, logger=logger
             )
             
             # GIF of diff
             create_diff_gif(
                 actual_ch, pred_ch, r_grid, z_grid,
                 instance_dir / f"{ch_name}_diff.gif",
-                args.fps, f"{instance_id} - {ch_name}", logger
+                args.fps, f"{instance_id} - {ch_name}", start_t=1, logger=logger
             )
     
     logger.info("=" * 60)

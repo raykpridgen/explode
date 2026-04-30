@@ -124,7 +124,7 @@ class ARWindowDataset(Dataset):
         
         # Pre-compute per-instance statistics if normalizing
         if self.normalize:
-            logger.info(f"Computing per-instance statistics for {self.n_instances} instances...")
+            print(f"Computing per-instance statistics for {self.n_instances} instances...")
             self.instance_stats = self._compute_instance_stats()
         else:
             self.instance_stats = None
@@ -148,7 +148,17 @@ class ARWindowDataset(Dataset):
         if not self.normalize or self.instance_stats is None:
             return data
         stats = self.instance_stats[instance_idx]
-        return (data - stats["mean"]) / stats["std"]
+        mean = stats["mean"]
+        std = stats["std"]
+
+        # Stats are computed from (T, F, C, D, H, W) with keepdims=True, so they
+        # have shape (1, F, C, 1, 1, 1). For single-frame targets (F, C, D, H, W),
+        # drop the leading singleton time axis to avoid introducing an extra dim.
+        if data.ndim == 5 and mean.ndim == 6:
+            mean = mean[0]
+            std = std[0]
+
+        return (data - mean) / std
         
     def __len__(self) -> int:
         return self.total_windows
@@ -180,10 +190,10 @@ class ARWindowDataset(Dataset):
         if self.normalize:
             x = self._normalize_instance(local_instance_idx, x)
             y = self._normalize_instance(local_instance_idx, y)
-        else:
-            # Ensure contiguous arrays before tensor conversion
-            x = np.ascontiguousarray(x)
-            y = np.ascontiguousarray(y)
+        
+        # Ensure contiguous arrays before tensor conversion
+        x = np.ascontiguousarray(x)
+        y = np.ascontiguousarray(y)
         
         # Convert to torch tensors
         x_tensor = torch.from_numpy(x).to(self.dtype)
