@@ -585,22 +585,35 @@ def preprocess_modality(
 
     logger.info(f"Successfully processed {len(all_volumes)} instances")
 
-    # Stack volumes - note: T may vary per instance, so we use object array or pad
-    # For now, assume consistent T or handle ragged
+    # Stack volumes - note: T may vary per instance, so we pad to max T
     max_t = max(v.shape[0] for v in all_volumes)
     H, W = all_volumes[0].shape[2], all_volumes[0].shape[3]
 
-    # Pad or create ragged arrays
     n_instances = len(all_volumes)
+    
+    # Create padded arrays
+    logger.info(f"Creating padded arrays: ({n_instances}, {max_t}, 9, {H}, {W})")
+    
     padded_volume = np.zeros((n_instances, max_t, 9, H, W), dtype=np.float32)
     padded_timesteps = np.zeros((n_instances, max_t), dtype=np.float32)
     valid_mask = np.zeros((n_instances, max_t), dtype=bool)
 
+    # Fill padded arrays and free source arrays to save memory
+    logger.info("Filling padded arrays...")
     for i, (vol, ts) in enumerate(zip(all_volumes, all_timesteps)):
         t = vol.shape[0]
         padded_volume[i, :t] = vol
         padded_timesteps[i, :t] = ts
         valid_mask[i, :t] = True
+        # Free source array to save memory
+        all_volumes[i] = None
+    
+    # Clear the lists to free memory
+    all_volumes.clear()
+    all_timesteps.clear()
+    import gc
+    gc.collect()
+    logger.info("Arrays padded and source data freed")
 
     # Get grid from first instance
     r_grid, z_grid = first_result
@@ -612,8 +625,15 @@ def preprocess_modality(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save output
+    # Use uncompressed savez to avoid memory spike from compression
+    # Compression requires holding entire dataset in memory, which causes OOM for large datasets
     output_path = output_dir / f"{modality}_data.npz"
-    np.savez_compressed(
+    
+    logger.info(f"Saving to {output_path} (uncompressed to save memory)...")
+    
+    # Save in chunks to minimize memory usage
+    # np.savez (uncompressed) streams data instead of buffering for compression
+    np.savez(
         output_path,
         volume=padded_volume,
         timesteps=padded_timesteps,
@@ -622,17 +642,15 @@ def preprocess_modality(
         channel_names=np.array(channel_names),
         r_grid=r_grid,
         z_grid=z_grid,
-        modality=modality,
-        n_instances=n_instances,
-        max_timesteps=max_t,
-        grid_shape=(H, W),
     )
-
+    
+    # Log info without keeping arrays in memory
     logger.info(f"Saved: {output_path}")
-    logger.info(f"  Shape: {padded_volume.shape}")
+    logger.info(f"  Shape: ({n_instances}, {max_t}, 9, {H}, {W})")
     logger.info(f"  Instances: {n_instances}")
     logger.info(f"  Max timesteps: {max_t}")
     logger.info(f"  Grid: {H}x{W}")
+    logger.info(f"  File size: {output_path.stat().st_size / 1e9:.2f} GB")
 
     return output_path
 

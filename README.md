@@ -329,7 +329,8 @@ python scripts/preprocess.py --modality cyl --data-root ./data --output-dir ./pr
 4. Applies `log1p` to pressure, `hypot(U,W)` to velocities
 5. Broadcasts 1D R/Z coordinates to 2D grid
 6. Pads variable-length trajectories to max T
-7. Saves `{modality}_data.npz` with fields:
+7. Frees source arrays during padding to save memory
+8. Saves `{modality}_data.npz` with fields (uncompressed to avoid OOM):
    - `volume`: (N, T, 9, H, W) float32
    - `timesteps`: (N, T) float32
    - `valid_mask`: (N, T) bool
@@ -341,15 +342,23 @@ python scripts/preprocess.py --modality cyl --data-root ./data --output-dir ./pr
 | Resource | CYL (2100 inst) | PLI (2100 inst) |
 |----------|----------------|-----------------|
 | Wall time | ~20-30 min | ~40-60 min |
-| Memory | ~8 GB | ~16 GB |
+| Memory | ~8 GB | ~16-24 GB |
 | CPU cores | 4-8 | 4-8 |
-| Output size | ~6 GB | ~24 GB |
+| Output size | ~12 GB (uncompressed) | ~48 GB (uncompressed) |
+
+**Memory efficiency note:**
+The script uses **uncompressed NPZ format** (`np.savez` instead of `np.savez_compressed`) because compression requires holding the entire dataset in memory twice (once for data, once for compressed buffer). This would cause OOM for large datasets. The output files are larger but the preprocessing completes without memory issues.
 
 **HPC resource specification:**
 ```bash
 # Slurm for CYL preprocessing
 #SBATCH --time=01:00:00
 #SBATCH --mem=16G
+#SBATCH --cpus-per-task=8
+
+# For PLI (larger memory needs)
+#SBATCH --time=02:00:00
+#SBATCH --mem=32G
 #SBATCH --cpus-per-task=8
 ```
 
