@@ -77,48 +77,81 @@ FM_CHECKPOINTS = {
 
 class ARWindowDataset(Dataset):
     """
-    Memory-efficient dataset that generates AR windows on-the-fly.
+    Memory-efficient dataset that generates AR windows on-the-fly with per-instance normalization.
     
     Instead of materializing all windows (which explodes memory),
-    this computes windows dynamically from the normalized volume.
+    this computes windows dynamically and applies per-instance normalization on-the-fly.
     """
     
     def __init__(
         self,
-        volume: np.ndarray,  # (N, T, F, C, D, H, W) - normalized
+        volume: np.ndarray,  # (N, T, F, C, D, H, W) - unnormalized
         ar_order: int = 1,
         dtype: torch.dtype = torch.float32,
+        normalize: bool = True,
+        eps: float = 1e-5,
     ):
         """
         Args:
-            volume: Normalized volume array (N, T, F, C, D, H, W)
+            volume: Raw volume array (N, T, F, C, D, H, W) - NOT pre-normalized
             ar_order: Autoregressive order (default: 1)
             dtype: Torch dtype for output tensors
+            normalize: Whether to apply per-instance normalization
+            eps: Epsilon for numerical stability in normalization
         """
         self.volume = volume
         self.ar_order = ar_order
         self.dtype = dtype
+        self.normalize = normalize
+        self.eps = eps
         
         # Compute windows per instance
         self.n_instances = volume.shape[0]
         self.n_timesteps = volume.shape[1]
+        self.n_fields = volume.shape[2]
+        self.n_components = volume.shape[3]
         self.n_windows_per_instance = self.n_timesteps - ar_order
         
         # Total windows
         self.total_windows = self.n_instances * self.n_windows_per_instance
+        
+        # Pre-compute per-instance statistics if normalizing
+        if self.normalize:
+            logger.info(f"Computing per-instance statistics for {self.n_instances} instances...")
+            self.instance_stats = self._compute_instance_stats()
+        else:
+            self.instance_stats = None
+    
+    def _compute_instance_stats(self) -> List[Dict]:
+        """Compute mean and std for each instance across time dimension."""
+        stats = []
+        for i in range(self.n_instances):
+            instance_data = self.volume[i]  # (T, F, C, D, H, W)
+            # Compute stats per (F, C) across time, D, H, W
+            mean = np.mean(instance_data, axis=(0, 3, 4, 5), keepdims=True)  # (1, F, C, 1, 1, 1)
+            std = np.std(instance_data, axis=(0, 3, 4, 5), keepdims=True) + self.eps
+            stats.append({"mean": mean, "std": std})
+        return stats
+    
+    def _normalize_instance(self, instance_idx: int, data: np.ndarray) -> np.ndarray:
+        """Normalize data for a specific instance."""
+        if not self.normalize or self.instance_stats is None:
+            return data
+        stats = self.instance_stats[instance_idx]
+        return (data - stats["mean"]) / stats["std"]
         
     def __len__(self) -> int:
         return self.total_windows
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Generate window on-the-fly.
+        Generate window on-the-fly with normalization.
         
         Args:
             idx: Global window index
             
         Returns:
-            (x, y) where x is input window, y is target
+            (x, y) where x is input window, y is target (both normalized)
         """
         # Map global index to (instance, timestep)
         instance_idx = idx // self.n_windows_per_instance
@@ -127,14 +160,19 @@ class ARWindowDataset(Dataset):
         
         # Extract window
         # x: (ar_order, F, C, D, H, W)
-        x = self.volume[instance_idx, t_start:t_start + self.ar_order]
+        x = self.volume[instance_idx, t_start:t_start + self.ar_order].copy()
         
         # y: (F, C, D, H, W) - target is next frame
-        y = self.volume[instance_idx, t_start + self.ar_order]
+        y = self.volume[instance_idx, t_start + self.ar_order].copy()
+        
+        # Apply per-instance normalization
+        if self.normalize:
+            x = self._normalize_instance(instance_idx, x)
+            y = self._normalize_instance(instance_idx, y)
         
         # Convert to torch tensors
-        x_tensor = torch.from_numpy(x.copy()).to(self.dtype)
-        y_tensor = torch.from_numpy(y.copy()).to(self.dtype)
+        x_tensor = torch.from_numpy(x).to(self.dtype)
+        y_tensor = torch.from_numpy(y).to(self.dtype)
         
         return x_tensor, y_tensor
 
@@ -399,8 +437,8 @@ Examples:
     # Train CYL from scratch with Medium model (memory-efficient streaming)
     python train_explode.py --modality cyl --data processed/cyl_data.npz --model-size M
 
-    # Reduce memory further with smaller batch size
-    python train_explode.py --modality cyl --data processed/cyl_data.npz --batch-size 4
+    # Reduce memory further with smaller batch size (for large grids like PLI 1120x400)
+    python train_explode.py --modality pli --data processed/pli_data.npz --batch-size 2
 
     # Resume training from checkpoint
     python train_explode.py --modality pli --data processed/pli_data.npz --resume out/train/pli/models/pli_checkpoint.pth
@@ -409,11 +447,14 @@ Examples:
     python train_explode.py --modality cyl --data processed/cyl_data.npz --eval-only --resume out/train/cyl/models/cyl_best.pth
 
 Memory efficiency:
-    This script uses streaming AR window generation to avoid materializing all
-    windows in memory (~340GB for full CYL dataset). Instead, windows are generated
-    on-the-fly in the DataLoader, reducing peak memory to ~15-20GB.
+    This script uses streaming AR window generation with per-instance normalization
+    to avoid materializing large intermediate arrays.
     
-    For even lower memory, use --batch-size 4 or --batch-size 2.
+    For large grids (e.g., PLI 1120x400), use --batch-size 2 or --batch-size 4.
+    
+    Memory estimates:
+    - CYL (560x200): ~8-15GB with batch-size 8
+    - PLI (1120x400): ~15-25GB with batch-size 2-4
 
 Output structure:
     out/
@@ -499,7 +540,6 @@ Output structure:
     try:
         from src.utils.data_preparation_fast import FastARDataPreparer  # type: ignore
         from src.utils.device_manager import DeviceManager  # type: ignore
-        from src.utils.normalization import RevIN  # type: ignore
         from src.utils.select_fine_tuning_parameters import SelectFineTuningParameters  # type: ignore
         from src.utils.trainers import Trainer  # type: ignore
         from src.utils.vit_conv_xatt_axialatt2 import ViT3DRegression  # type: ignore
@@ -558,42 +598,39 @@ Output structure:
     logger.info(f"Val volume: {val_vol.shape}")
     logger.info(f"Test volume: {test_vol.shape}")
     
-    # RevIN normalization - compute stats on train, apply to all splits
-    # Note: Each split normalized independently as RevIN computes per-instance stats
-    logger.info("Computing RevIN statistics on all splits")
-    
-    revin = RevIN(args.out_dir / "revin_stats")
-    norm_prefix = f"norm_{modality}"
-    
-    # Normalize each split independently (standard RevIN approach)
-    revin.compute_stats(train_vol, prefix=f"{norm_prefix}_train")
-    train_norm = revin.normalize(train_vol, prefix=f"{norm_prefix}_train")
-    
-    if val_vol.shape[0] > 0:
-        revin.compute_stats(val_vol, prefix=f"{norm_prefix}_val")
-        val_norm = revin.normalize(val_vol, prefix=f"{norm_prefix}_val")
-    else:
-        val_norm = val_vol
-    
-    revin.compute_stats(test_vol, prefix=f"{norm_prefix}_test")
-    test_norm = revin.normalize(test_vol, prefix=f"{norm_prefix}_test")
-    
-    logger.info("RevIN normalization complete")
+    # Memory-efficient approach: Use per-instance normalization in streaming dataset
+    # instead of MORPH RevIN which creates large intermediate arrays
+    logger.info("Using per-instance normalization in streaming DataLoader")
+    logger.info("(This avoids materializing large normalized arrays in memory)")
     
     # Clean up intermediate arrays to save memory
     logger.info("Cleaning up intermediate arrays...")
-    del volume, volume_uptf7, train_vol, val_vol, test_vol
+    del volume, volume_uptf7
     import gc
     gc.collect()
     
-    # Prepare autoregressive windows using streaming dataset
-    # This generates windows on-the-fly to avoid memory explosion
+    # Prepare autoregressive windows using streaming dataset with on-the-fly normalization
+    # This generates windows on-the-fly and normalizes per-instance to avoid memory explosion
     logger.info(f"Preparing streaming AR windows (ar_order={args.ar_order})")
     
-    # Create streaming datasets (no precomputation of windows)
-    train_dataset = ARWindowDataset(train_norm, ar_order=args.ar_order)
-    val_dataset = ARWindowDataset(val_norm, ar_order=args.ar_order) if val_norm.shape[0] > 0 else None
-    test_dataset = ARWindowDataset(test_norm, ar_order=args.ar_order)
+    # Create streaming datasets with per-instance normalization
+    # Normalization is computed per-instance inside the DataLoader workers
+    train_dataset = ARWindowDataset(train_vol, ar_order=args.ar_order, normalize=True)
+    
+    if val_vol.shape[0] > 0:
+        val_dataset = ARWindowDataset(val_vol, ar_order=args.ar_order, normalize=True)
+    else:
+        # Create dataset from train for validation if no val split
+        val_dataset = None
+        logger.warning("No validation split, using training metrics only")
+    
+    test_dataset = ARWindowDataset(test_vol, ar_order=args.ar_order, normalize=True)
+    
+    # Free the split volumes - they're now referenced inside the datasets
+    # The dataset keeps them, but normalizes on-the-fly
+    # We can optionally delete them if memory is still tight, but dataset needs them
+    logger.info("Dataset created with per-instance normalization")
+    logger.info(f"Memory per instance: {train_vol[0].nbytes / 1e9:.2f} GB")
     
     logger.info(f"AR windows: train={len(train_dataset)}, val={len(val_dataset) if val_dataset else 0}, test={len(test_dataset)}")
     

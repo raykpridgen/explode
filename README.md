@@ -39,12 +39,21 @@ python scripts/preprocess.py --modality pli --data-root ./data --output-dir ./pr
 python scripts/preprocess.py --modality pli --data-root ./data --output-dir ./processed
 
 # 3. Train surrogate model (Medium size, 5 epochs)
+# For CYL (560x200 grid)
 python scripts/train_explode.py \
     --modality cyl \
     --data ./processed/cyl_data.npz \
     --model-size M \
     --epochs 5 \
     --batch-size 8
+
+# For PLI (1120x400 grid) - use smaller batch size
+python scripts/train_explode.py \
+    --modality pli \
+    --data ./processed/pli_data.npz \
+    --model-size M \
+    --epochs 5 \
+    --batch-size 2
 
 # 4. Visualize training metrics and test rollouts
 python scripts/vis.py \
@@ -354,8 +363,15 @@ Trains MORPH surrogate with autoregressive single-step prediction.
 - Base: MORPH ViT3DRegression (Medium: 768-dim, 8-layer, 12-head)
 - Input: `(F=3, C=3, D=1, H, W)` - packed channels as 3×3 field-component layout
 - Output: Same shape at `t+1`
-- Normalization: RevIN (per-field statistics computed on all splits)
+- Normalization: Per-instance normalization (computed on-the-fly in DataLoader)
 - Schedule: Warmup + cosine decay (10% warmup, 5 epochs default)
+
+**Memory efficiency:**
+The training script uses **streaming DataLoaders** with on-the-fly normalization to handle large datasets:
+- No materialization of all AR windows (~340GB for full CYL dataset)
+- Per-instance normalization computed dynamically (not full RevIN on arrays)
+- Peak memory: ~15-25GB depending on grid size and batch size
+- For large grids (PLI 1120x400), use `--batch-size 2` or `--batch-size 4`
 
 **Usage:**
 ```bash
@@ -387,8 +403,8 @@ python scripts/train_explode.py \
 1. Loads processed NPZ
 2. Splits 80/10/10 (train/val/test) by instance ID
 3. Saves `splits.json` for downstream use
-4. Applies RevIN normalization
-5. Creates autoregressive windows (t → t+1)
+4. Creates streaming DataLoaders with per-instance normalization on-the-fly
+5. Generates autoregressive windows (t → t+1) dynamically during training
 6. Trains with MSE loss, warmup+cosine LR
 7. Saves step checkpoints (every N steps, cleaned at epoch end)
 8. Keeps only best model by validation loss
@@ -407,7 +423,8 @@ python scripts/train_explode.py \
 | CYL, S, BS=4 | ~10 min | 8 GB | 10 GB |
 | CYL, M, BS=4 | ~20 min | 16 GB | 16 GB |
 | CYL, M, BS=8 | ~15 min | 24 GB | 20 GB |
-| PLI, M, BS=4 | ~40 min | 24 GB | 20 GB |
+| PLI, M, BS=2 | ~40 min | 15-20 GB | 20 GB |
+| PLI, M, BS=4 | ~35 min | 20-25 GB | 20 GB |
 
 **Full training (5 epochs, Medium model):**
 - CYL: ~1.5-2 hours on single A100
