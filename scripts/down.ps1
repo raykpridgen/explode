@@ -23,6 +23,19 @@ if (-not (Test-Path $outputDir)) {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
 
+$wgetCmd = Get-Command "wget.exe" -ErrorAction SilentlyContinue
+if (-not $wgetCmd) {
+    throw "GNU wget was not found as wget.exe. Install wget and ensure wget.exe is on PATH."
+}
+
+$aria2Cmd = Get-Command "aria2c.exe" -ErrorAction SilentlyContinue
+if (-not $aria2Cmd) {
+    $aria2Cmd = Get-Command "aria2c" -ErrorAction SilentlyContinue
+}
+if (-not $aria2Cmd) {
+    throw "aria2c was not found on PATH."
+}
+
 Push-Location $outputDir
 try {
     $urlsFile = Join-Path $outputDir "urls.txt"
@@ -35,7 +48,7 @@ try {
         $target = "$baseUrl/id$id/"
 
         # Parse wget spider output for discovered URLs, matching the original shell scripts.
-        $matches = & wget -r -np -nd --spider $target 2>&1 |
+        $matches = & $wgetCmd.Source -r -np -nd --spider $target 2>&1 |
             ForEach-Object { "$_" } |
             Where-Object { $_ -like "--*" } |
             ForEach-Object {
@@ -51,7 +64,7 @@ try {
     }
 
     Write-Host "DOWNLOAD START"
-    & aria2c -i $urlsFile -j 8 -x 8 -s 8 --continue=true --max-tries=0
+    & $aria2Cmd.Source -i $urlsFile -j 8 -x 8 -s 8 --continue=true --max-tries=0
 }
 finally {
     Pop-Location
