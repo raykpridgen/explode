@@ -86,20 +86,26 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 # ==================== DATA LOADING ====================
 
-def discover_instances(data_root: Path, modality: str) -> List[Path]:
+def discover_instances(data_root: Path, modality: str, flat_structure: bool = False) -> List[Path]:
     """
-    Discover all simulation instance directories.
+    Discover all simulation instance directories or files.
 
     Args:
         data_root: Root directory containing raw data
         modality: 'cyl' or 'pli'
+        flat_structure: If True, look for flat NPZ files instead of idXXXXX directories
 
     Returns:
-        List of Paths to instance directories (idXXXXX)
+        List of Paths to instance directories (idXXXXX) or modality dir for flat structure
     """
     modality_dir = data_root / modality
     if not modality_dir.exists():
         raise FileNotFoundError(f"Modality directory not found: {modality_dir}")
+
+    # Check for flat structure (NPZ files directly in modality_dir)
+    if flat_structure:
+        logger.info(f"Using flat structure for {modality}")
+        return [modality_dir]
 
     # Find all idXXXXX directories
     instance_dirs = []
@@ -109,21 +115,65 @@ def discover_instances(data_root: Path, modality: str) -> List[Path]:
         if item.is_dir() and pattern.match(item.name):
             instance_dirs.append(item)
 
+    # If no instance dirs found, check for flat structure
+    if not instance_dirs:
+        npz_files = list(modality_dir.glob("*.npz"))
+        if npz_files:
+            logger.warning(f"No idXXXXX directories found, but found {len(npz_files)} NPZ files.")
+            logger.warning(f"Use --flat-structure flag to process flat directory layout.")
+
     instance_dirs.sort()
     return instance_dirs
 
 
-def load_instance_npz_files(instance_dir: Path) -> List[Path]:
+def get_instance_id_from_filename(filename: str, modality: str) -> Optional[str]:
+    """
+    Extract instance ID from NPZ filename.
+    
+    Args:
+        filename: NPZ filename
+        modality: 'cyl' or 'pli'
+    
+    Returns:
+        Instance ID string (e.g., 'id00001') or None
+    """
+    if modality == "cyl":
+        # Pattern: cx241203_id00001_pvi_idx00000.npz
+        match = re.search(r"id(\d{5})", filename)
+    elif modality == "pli":
+        # Pattern: pli240420_id00001_pvi_idx00000.npz
+        match = re.search(r"id(\d{5})", filename)
+    else:
+        return None
+    
+    if match:
+        return f"id{match.group(1)}"
+    return None
+
+
+def load_instance_npz_files(instance_dir: Path, instance_id: Optional[str] = None, modality: Optional[str] = None) -> List[Path]:
     """
     Find and sort all NPZ timestep files for an instance.
 
     Args:
-        instance_dir: Path to instance directory (e.g., id00001)
+        instance_dir: Path to instance directory (e.g., id00001) or modality dir for flat structure
+        instance_id: Instance ID for filtering in flat structure (e.g., 'id00001')
+        modality: Modality for flat structure filename parsing
 
     Returns:
         Sorted list of NPZ file paths
     """
-    npz_files = list(instance_dir.glob("*.npz"))
+    if instance_id and modality:
+        # Flat structure: filter by instance ID in filename
+        all_npz_files = list(instance_dir.glob("*.npz"))
+        npz_files = []
+        for f in all_npz_files:
+            file_instance_id = get_instance_id_from_filename(f.name, modality)
+            if file_instance_id == instance_id:
+                npz_files.append(f)
+    else:
+        # Hierarchical structure: all NPZ files in directory belong to this instance
+        npz_files = list(instance_dir.glob("*.npz"))
 
     # Sort by index in filename (e.g., idx00000, idx00001, ...)
     def sort_key(p: Path) -> int:
@@ -134,6 +184,35 @@ def load_instance_npz_files(instance_dir: Path) -> List[Path]:
 
     npz_files.sort(key=sort_key)
     return npz_files
+
+
+def discover_instances_flat(data_root: Path, modality: str) -> List[str]:
+    """
+    Discover all instance IDs from flat directory structure.
+    
+    Args:
+        data_root: Root directory containing raw data
+        modality: 'cyl' or 'pli'
+    
+    Returns:
+        List of instance ID strings (e.g., ['id00001', 'id00002', ...])
+    """
+    modality_dir = data_root / modality
+    if not modality_dir.exists():
+        raise FileNotFoundError(f"Modality directory not found: {modality_dir}")
+
+    # Find all unique instance IDs from NPZ filenames
+    instance_ids = set()
+    npz_files = list(modality_dir.glob("*.npz"))
+    
+    for npz_file in npz_files:
+        instance_id = get_instance_id_from_filename(npz_file.name, modality)
+        if instance_id:
+            instance_ids.add(instance_id)
+    
+    sorted_ids = sorted(instance_ids)
+    logger.info(f"Discovered {len(sorted_ids)} instances from flat directory")
+    return sorted_ids
 
 
 def load_npz_timestep(npz_path: Path, dtype: np.dtype = np.float32) -> Dict[str, np.ndarray]:
@@ -323,14 +402,16 @@ def process_instance(
     instance_dir: Path,
     modality: str,
     logger: logging.Logger,
+    instance_id: Optional[str] = None,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """
     Process all timesteps for a single simulation instance.
 
     Args:
-        instance_dir: Path to instance directory
+        instance_dir: Path to instance directory (or modality dir for flat structure)
         modality: 'cyl' or 'pli'
         logger: Logger instance
+        instance_id: Instance ID for flat structure (e.g., 'id00001')
 
     Returns:
         Tuple of (volume, timesteps, r_grid, z_grid) or None if failed
@@ -339,11 +420,16 @@ def process_instance(
         - r_grid: (H, W) broadcast R coordinates
         - z_grid: (H, W) broadcast Z coordinates
     """
-    instance_id = instance_dir.name
-    logger.debug(f"Processing instance: {instance_id}")
-
-    # Find all NPZ files
-    npz_files = load_instance_npz_files(instance_dir)
+    if instance_id:
+        # Flat structure: instance_dir is actually the modality directory
+        logger.debug(f"Processing instance: {instance_id} (flat structure)")
+        npz_files = load_instance_npz_files(instance_dir, instance_id, modality)
+    else:
+        # Hierarchical structure: instance_dir is the instance directory
+        instance_id = instance_dir.name
+        logger.debug(f"Processing instance: {instance_id}")
+        npz_files = load_instance_npz_files(instance_dir)
+    
     if not npz_files:
         logger.warning(f"No NPZ files found for {instance_id}")
         return None
@@ -399,6 +485,7 @@ def preprocess_modality(
     modality: str,
     max_instances: Optional[int] = None,
     logger: logging.Logger = None,
+    flat_structure: bool = False,
 ) -> Path:
     """
     Preprocess all instances for a single modality.
@@ -409,6 +496,7 @@ def preprocess_modality(
         modality: 'cyl' or 'pli'
         max_instances: Limit number of instances (for testing)
         logger: Logger instance
+        flat_structure: If True, expect flat directory structure (NPZ files directly in modality dir)
 
     Returns:
         Path to output NPZ file
@@ -418,37 +506,79 @@ def preprocess_modality(
     logger.info(f"Starting preprocessing for modality: {modality}")
     logger.info(f"Data root: {data_root}")
     logger.info(f"Output dir: {output_dir}")
+    
+    # Detect flat structure if not specified
+    modality_dir = data_root / modality
+    if not flat_structure and modality_dir.exists():
+        # Check if there are idXXXXX directories
+        has_instance_dirs = any(d.is_dir() and re.match(r"^id\d{5}$", d.name) for d in modality_dir.iterdir())
+        # Check if there are NPZ files directly in the directory
+        has_flat_npz = len(list(modality_dir.glob("*.npz"))) > 0
+        
+        if not has_instance_dirs and has_flat_npz:
+            logger.info(f"Detected flat directory structure for {modality}")
+            flat_structure = True
 
-    # Discover instances
-    instance_dirs = discover_instances(data_root, modality)
-    logger.info(f"Discovered {len(instance_dirs)} instances")
+    if flat_structure:
+        # Flat structure: discover instance IDs from filenames
+        instance_ids = discover_instances_flat(data_root, modality)
+        logger.info(f"Discovered {len(instance_ids)} instances from flat structure")
+        
+        if max_instances:
+            instance_ids = instance_ids[:max_instances]
+            logger.info(f"Limited to {len(instance_ids)} instances for testing")
+        
+        # Process each instance
+        all_volumes = []
+        all_timesteps = []
+        all_instance_ids = []
+        first_result = None
+        
+        for instance_id in tqdm(instance_ids, desc=f"Processing {modality}"):
+            result = process_instance(modality_dir, modality, logger, instance_id)
+            if result is None:
+                logger.warning(f"Skipping instance: {instance_id}")
+                continue
 
-    if max_instances:
-        instance_dirs = instance_dirs[:max_instances]
-        logger.info(f"Limited to {len(instance_dirs)} instances for testing")
+            volume, timesteps, r_grid, z_grid = result
 
-    # Process instances
-    all_volumes = []
-    all_timesteps = []
-    all_instance_ids = []
+            if first_result is None:
+                first_result = (r_grid, z_grid)
 
-    # Use first instance for grid shape (assumes consistent)
-    first_result = None
+            all_volumes.append(volume)
+            all_timesteps.append(timesteps)
+            all_instance_ids.append(instance_id)
+    else:
+        # Hierarchical structure
+        instance_dirs = discover_instances(data_root, modality)
+        logger.info(f"Discovered {len(instance_dirs)} instances")
 
-    for instance_dir in tqdm(instance_dirs, desc=f"Processing {modality}"):
-        result = process_instance(instance_dir, modality, logger)
-        if result is None:
-            logger.warning(f"Skipping instance: {instance_dir.name}")
-            continue
+        if max_instances:
+            instance_dirs = instance_dirs[:max_instances]
+            logger.info(f"Limited to {len(instance_dirs)} instances for testing")
 
-        volume, timesteps, r_grid, z_grid = result
+        # Process instances
+        all_volumes = []
+        all_timesteps = []
+        all_instance_ids = []
 
-        if first_result is None:
-            first_result = (r_grid, z_grid)
+        # Use first instance for grid shape (assumes consistent)
+        first_result = None
 
-        all_volumes.append(volume)
-        all_timesteps.append(timesteps)
-        all_instance_ids.append(instance_dir.name)
+        for instance_dir in tqdm(instance_dirs, desc=f"Processing {modality}"):
+            result = process_instance(instance_dir, modality, logger)
+            if result is None:
+                logger.warning(f"Skipping instance: {instance_dir.name}")
+                continue
+
+            volume, timesteps, r_grid, z_grid = result
+
+            if first_result is None:
+                first_result = (r_grid, z_grid)
+
+            all_volumes.append(volume)
+            all_timesteps.append(timesteps)
+            all_instance_ids.append(instance_dir.name)
 
     if not all_volumes:
         raise RuntimeError(f"No valid instances processed for {modality}")
@@ -514,14 +644,34 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Preprocess CYL modality
+    # Preprocess CYL modality (hierarchical structure with idXXXXX directories)
     python preprocess.py --modality cyl --data-root ./data --output-dir ./processed
 
-    # Preprocess PLI modality
+    # Preprocess PLI modality (flat structure with NPZ files directly in data/pli/)
+    python preprocess.py --modality pli --data-root ./data --output-dir ./processed --flat-structure
+
+    # Auto-detect structure (will detect flat if no idXXXXX directories found)
     python preprocess.py --modality pli --data-root ./data --output-dir ./processed
 
     # Process only first 10 instances for testing
     python preprocess.py --modality cyl --max-instances 10 --verbose
+
+Directory structure support:
+    Hierarchical (default for CYL):
+        data/cyl/
+            id00001/
+                cx241203_id00001_pvi_idx00000.npz
+                ...
+            id00002/
+                ...
+    
+    Flat (common for PLI downloads):
+        data/pli/
+            pli240420_id00001_pvi_idx00000.npz
+            pli240420_id00001_pvi_idx00001.npz
+            ...
+            pli240420_id00002_pvi_idx00000.npz
+            ...
 
 Output format:
     Creates {modality}_data.npz containing:
@@ -561,6 +711,12 @@ Output format:
         help="Maximum number of instances to process (for testing)",
     )
     parser.add_argument(
+        "--flat-structure",
+        action="store_true",
+        help="Use flat directory structure (NPZ files directly in modality dir, not in idXXXXX subdirs). "
+             "Auto-detected if not specified.",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -570,6 +726,7 @@ Output format:
     args = parser.parse_args()
 
     # Setup logging
+    global logger
     logger = setup_logging(args.verbose)
 
     logger.info("=" * 60)
@@ -588,6 +745,7 @@ Output format:
             modality=args.modality,
             max_instances=args.max_instances,
             logger=logger,
+            flat_structure=args.flat_structure,
         )
         logger.info("=" * 60)
         logger.info(f"Preprocessing complete: {output_path}")

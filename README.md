@@ -29,7 +29,14 @@ python scripts/download_streaming.py --modality cyl --data-root ./data
 # ./scripts/download_data.sh -m cyl -o ./data
 
 # 2. Preprocess raw data to packed NPZ
+# For CYL (hierarchical structure with idXXXXX directories)
 python scripts/preprocess.py --modality cyl --data-root ./data --output-dir ./processed
+
+# For PLI with flat structure (all NPZ files directly in data/pli/)
+python scripts/preprocess.py --modality pli --data-root ./data --output-dir ./processed --flat-structure
+
+# Or let it auto-detect the structure
+python scripts/preprocess.py --modality pli --data-root ./data --output-dir ./processed
 
 # 3. Train surrogate model (Medium size, 5 epochs)
 python scripts/train_explode.py \
@@ -269,22 +276,51 @@ Converts raw timestep NPZ files into consolidated, channel-packed NPZ ready for 
 | 7 | av_pressure | av_pressure | `log1p(x)` |
 | 8 | speed | speed | `hypot(U, W)` |
 
+**Directory structure support:**
+
+The script auto-detects directory structure, or you can specify with `--flat-structure`:
+
+**Hierarchical (default for CYL):**
+```
+data/cyl/
+    id00001/
+        cx241203_id00001_pvi_idx00000.npz
+        cx241203_id00001_pvi_idx00001.npz
+        ...
+    id00002/
+        ...
+```
+
+**Flat (common for PLI downloads):**
+```
+data/pli/
+    pli240420_id00001_pvi_idx00000.npz
+    pli240420_id00001_pvi_idx00001.npz
+    ...
+    pli240420_id00002_pvi_idx00000.npz
+    ...
+```
+
 **Usage:**
 ```bash
-# Full preprocessing (2100 instances)
+# Full preprocessing (2100 instances) - auto-detects structure
 python scripts/preprocess.py --modality cyl --data-root ./data --output-dir ./processed
+
+# Force flat structure mode (for PLI with flat directory)
+python scripts/preprocess.py --modality pli --data-root ./data --output-dir ./processed --flat-structure
 
 # Quick test (first 10 instances)
 python scripts/preprocess.py --modality cyl --data-root ./data --output-dir ./processed_test --max-instances 10
 ```
 
 **What it does:**
-1. Discovers `idXXXXX` folders in `data/{cyl,pli}/`
-2. Loads each timestep NPZ, extracts features
-3. Applies `log1p` to pressure, `hypot(U,W)` to velocities
-4. Broadcasts 1D R/Z coordinates to 2D grid
-5. Pads variable-length trajectories to max T
-6. Saves `{modality}_data.npz` with fields:
+1. Detects directory structure (hierarchical `idXXXXX/` or flat)
+2. Groups NPZ files by instance ID (from filename for flat structure)
+3. Loads each timestep NPZ, extracts features
+4. Applies `log1p` to pressure, `hypot(U,W)` to velocities
+5. Broadcasts 1D R/Z coordinates to 2D grid
+6. Pads variable-length trajectories to max T
+7. Saves `{modality}_data.npz` with fields:
    - `volume`: (N, T, 9, H, W) float32
    - `timesteps`: (N, T) float32
    - `valid_mask`: (N, T) bool
