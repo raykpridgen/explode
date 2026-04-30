@@ -1,71 +1,45 @@
-param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet("cyl", "pli")]
-    [string]$Dataset
-)
+# Configuration
+$baseUrl = "https://oceans11.lanl.gov/heat/"
+$targets = @("cyl/", "pli/")
+$outputRoot = Get-Location # Downloads to current folder
 
-switch ($Dataset) {
-    "cyl" {
-        $rangeStart = 1600
-        $rangeEnd = 2100
-        $baseUrl = "https://oceans11.lanl.gov/heat/cyl/cx241203_fp16_full"
-        $outputDir = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../data/cyl"))
-    }
-    "pli" {
-        $rangeStart = 1600
-        $rangeEnd = 1800
-        $baseUrl = "https://oceans11.lanl.gov/heat/pli/pli240420"
-        $outputDir = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../data/cyl"))
-    }
-}
+foreach ($target in $targets) {
+    $targetUrl = $baseUrl + $target
+    Write-Host "Scanning $targetUrl..." -ForegroundColor Cyan
+    
+    # Create the local base folder (cyl/ or pli/)
+    $localTargetDir = Join-Path $outputRoot $target.TrimEnd('/')
+    if (!(Test-Path $localTargetDir)) { New-Item -ItemType Directory -Path $localTargetDir }
 
-if (-not (Test-Path $outputDir)) {
-    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-}
+    # Fetch the index page of the subfolder
+    $response = Invoke-WebRequest -Uri $targetUrl -UseBasicParsing
+    
+    # Filter for links that look like 'idXXXXX/'
+    $idLinks = $response.Links | Where-Object { $_.href -match '^id\d+/' } | Select-Object -ExpandProperty href
 
-$wgetCmd = Get-Command "wget.exe" -ErrorAction SilentlyContinue
-if (-not $wgetCmd) {
-    throw "GNU wget was not found as wget.exe. Install wget and ensure wget.exe is on PATH."
-}
+    foreach ($id in $idLinks) {
+        $idUrl = $targetUrl + $id
+        $localIdDir = Join-Path $localTargetDir $id.TrimEnd('/')
+        
+        if (!(Test-Path $localIdDir)) { New-Item -ItemType Directory -Path $localIdDir }
+        
+        Write-Host "  Downloading from $id..." -ForegroundColor Gray
+        
+        # Get the files inside the idXXXXX/ folder
+        $idPage = Invoke-WebRequest -Uri $idUrl -UseBasicParsing
+        $files = $idPage.Links | Where-Object { $_.href -match '\.npz$' } | Select-Object -ExpandProperty href
 
-$aria2Cmd = Get-Command "aria2c.exe" -ErrorAction SilentlyContinue
-if (-not $aria2Cmd) {
-    $aria2Cmd = Get-Command "aria2c" -ErrorAction SilentlyContinue
-}
-if (-not $aria2Cmd) {
-    throw "aria2c was not found on PATH."
-}
-
-Push-Location $outputDir
-try {
-    $urlsFile = Join-Path $outputDir "urls.txt"
-    if (Test-Path $urlsFile) {
-        Remove-Item $urlsFile -Force
-    }
-
-    foreach ($i in $rangeStart..$rangeEnd) {
-        $id = "{0:D5}" -f $i
-        $target = "$baseUrl/id$id/"
-
-        # Parse wget spider output for discovered URLs, matching the original shell scripts.
-        $matches = & $wgetCmd.Source -r -np -nd --spider $target 2>&1 |
-            ForEach-Object { "$_" } |
-            Where-Object { $_ -like "--*" } |
-            ForEach-Object {
-                $parts = $_ -split "\s+"
-                if ($parts.Length -ge 3) {
-                    $parts[2]
-                }
+        foreach ($file in $files) {
+            $fileUrl = $idUrl + $file
+            $destPath = Join-Path $localIdDir $file
+            
+            if (!(Test-Path $destPath)) {
+                Write-Host "    -> $file"
+                Invoke-WebRequest -Uri $fileUrl -OutFile $destPath
+            } else {
+                Write-Host "    -> $file (Skipped: Already exists)" -ForegroundColor DarkYellow
             }
-
-        if ($matches) {
-            $matches | Add-Content -Path $urlsFile
         }
     }
-
-    Write-Host "DOWNLOAD START"
-    & $aria2Cmd.Source -i $urlsFile -j 8 -x 8 -s 8 --continue=true --max-tries=0
 }
-finally {
-    Pop-Location
-}
+Write-Host "Download Complete!" -ForegroundColor Green
